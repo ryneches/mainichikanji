@@ -1,0 +1,93 @@
+name: Asahi RSS smoke test
+
+# Purpose: check whether a GitHub Actions runner can reach the Asahi RSS
+# feeds. claude.ai's fetcher is blocked by asahi.com, but the production
+# scripts will run here on GitHub infrastructure, so this is the test that
+# actually matters.
+#
+# Trigger it manually:
+#   - GitHub UI: Actions tab -> "Asahi RSS smoke test" -> Run workflow
+#   - CLI:       gh workflow run asahi-smoke-test.yml -f url=<feed-url>
+#
+# The default URL is the Asahi headlines feed. Change the input to point the
+# same test at any other feed you want to spot-check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: RSS/RDF feed URL to fetch
+        required: true
+        default: https://www.asahi.com/rss/asahi/newsheadlines.rdf
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch and inspect
+        env:
+          URL: ${{ github.event.inputs.url }}
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          echo "Fetching: $URL"
+
+          # No --fail: keep whatever comes back (even a block page) so it lands
+          # in the artifact for inspection. A browser-like UA is sent in case
+          # Asahi filters on user agent; adjust or drop it if needed.
+          code=$(curl -sSL \
+            --connect-timeout 15 --max-time 60 --retry 2 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36" \
+            -D out/headers.txt \
+            -o out/feed.xml \
+            -w '%{http_code}' \
+            "$URL") || true
+
+          size=$(wc -c < out/feed.xml | tr -d ' ')
+          echo "HTTP status: $code"
+          echo "Body size:   $size bytes"
+
+          {
+            echo "## Asahi RSS smoke test"
+            echo
+            echo "- URL: \`$URL\`"
+            echo "- HTTP status: \`$code\`"
+            echo "- Body size: \`$size\` bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ct=$(grep -i '^content-type:' out/headers.txt | tail -1 | tr -d '\r' || true)
+          [ -n "$ct" ] && echo "- $ct" >> "$GITHUB_STEP_SUMMARY"
+
+          # xmllint ships on ubuntu-latest. A well-formed parse with a sane item
+          # count is the signal that we got the real feed, not a block page.
+          if command -v xmllint >/dev/null && xmllint --noout out/feed.xml 2>/dev/null; then
+            items=$(xmllint --xpath 'count(//*[local-name()="item"])' out/feed.xml 2>/dev/null || echo '?')
+            title=$(xmllint --xpath '(//*[local-name()="item"]/*[local-name()="title"])[1]/text()' out/feed.xml 2>/dev/null || true)
+            echo "- XML well-formed: yes" >> "$GITHUB_STEP_SUMMARY"
+            echo "- item count: \`$items\`" >> "$GITHUB_STEP_SUMMARY"
+            [ -n "$title" ] && echo "- first item: $title" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- XML well-formed: NO (likely a block or error page, not the feed)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo
+            echo "First 20 lines of the response:"
+            echo '```'
+            head -n 20 out/feed.xml || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "----- first 20 lines -----"
+          head -n 20 out/feed.xml || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asahi-rss-smoke-test
+          path: out/
+          if-no-files-found: warn
