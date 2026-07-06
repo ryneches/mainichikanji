@@ -1,0 +1,140 @@
+name: Asahi section spot-check
+
+# Fetches the lighter Asahi section feeds from a GitHub runner (which can reach
+# Asahi, unlike claude.ai), then prints a comparison table and each feed's item
+# titles into the run summary so you can eyeball suitability without downloading
+# anything. All raw feeds are also saved in a single artifact.
+#
+# Trigger from the Actions tab ("Run workflow"), or:
+#   gh workflow run asahi-section-spotcheck.yml
+# Optionally add one more feed to the run with the extra_url input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      extra_url:
+        description: optional extra feed URL to include
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  spotcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch feeds
+        env:
+          EXTRA_URL: ${{ github.event.inputs.extra_url }}
+        run: |
+          set -uo pipefail
+          mkdir -p out
+
+          # slug|label|url  (slug is the artifact filename and short label)
+          feeds=(
+            "culture|Culture & Events|https://www.asahi.com/rss/asahi/culture.rdf"
+            "food|Food & Cooking|https://www.asahi.com/rss/asahi/food.rdf"
+            "edu|Education|https://www.asahi.com/rss/asahi/edu.rdf"
+            "health|Health|https://www.asahi.com/rss/asahi/health.rdf"
+            "eco|Energy & Environment|https://www.asahi.com/rss/asahi/eco.rdf"
+            "business|Business|https://www.asahi.com/rss/asahi/business.rdf"
+          )
+          [ -n "$EXTRA_URL" ] && feeds+=("extra|Extra|$EXTRA_URL")
+
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+          : > out/manifest.tsv
+          for f in "${feeds[@]}"; do
+            slug="${f%%|*}"; rest="${f#*|}"; label="${rest%%|*}"; url="${rest#*|}"
+            echo "Fetching $slug: $url"
+            code=$(curl -sSL --connect-timeout 15 --max-time 60 --retry 2 \
+              -A "$UA" -o "out/$slug.xml" -w '%{http_code}' "$url") || true
+            printf '%s\t%s\t%s\t%s\n' "$slug" "$label" "$code" "out/$slug.xml" >> out/manifest.tsv
+          done
+
+      - name: Summarize
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import os, xml.etree.ElementTree as ET
+
+          def ln(t): return t.rsplit('}', 1)[-1]
+          def child(el, name):
+              for c in el:
+                  if ln(c.tag) == name:
+                      return (c.text or '').strip()
+              return ''
+
+          rows = []
+          with open('out/manifest.tsv') as m:
+              for line in m:
+                  parts = line.rstrip('\n').split('\t')
+                  if len(parts) == 4:
+                      rows.append(parts)
+
+          out = []
+          def emit(s): out.append(s)
+
+          emit('# Asahi section feed spot-check\n')
+          emit('| feed | status | items | desc populated | newest |')
+          emit('|---|---|---|---|---|')
+
+          details = []
+          for slug, label, code, path in rows:
+              n = pop = 0
+              latest = ''
+              first_desc = ''
+              titles = []
+              ok = False
+              try:
+                  root = ET.parse(path).getroot()
+                  items = [e for e in root.iter() if ln(e.tag) == 'item']
+                  n = len(items)
+                  dates = []
+                  for it in items:
+                      d = child(it, 'description')
+                      if d:
+                          pop += 1
+                          if not first_desc:
+                              first_desc = d
+                      da = child(it, 'date')
+                      if da:
+                          dates.append(da)
+                      titles.append((child(it, 'subject'), da[:16], child(it, 'title')))
+                  latest = max(dates)[:16] if dates else ''
+                  ok = True
+              except Exception as e:
+                  titles = [('', '', 'parse failed: %s' % e)]
+              emit('| %s `%s.rdf` | `%s` | %d | %d/%d | %s |'
+                   % (label, slug, code, n, pop, n, latest))
+              details.append((slug, label, code, n, pop, first_desc, titles, ok))
+
+          for slug, label, code, n, pop, first_desc, titles, ok in details:
+              emit('\n## %s  `%s.rdf`' % (label, slug))
+              if not ok:
+                  emit('_could not parse (HTTP %s). See artifact._' % code)
+                  continue
+              if first_desc:
+                  emit('_sample description:_ %s\n' % first_desc)
+              cap = 18
+              for su, da, ti in titles[:cap]:
+                  tag = '[%s] ' % su if su else ''
+                  emit('- %s%s  %s' % (tag, da, ti))
+              if n > cap:
+                  emit('- _...(+%d more)_' % (n - cap))
+
+          text = '\n'.join(out)
+          print(text)
+          summ = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summ:
+              with open(summ, 'a') as f:
+                  f.write(text + '\n')
+          PY
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asahi-section-spotcheck
+          path: out/
+          if-no-files-found: warn
